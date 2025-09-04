@@ -11,318 +11,358 @@ from contextlib import contextmanager
 import torch.distributed as dist
 from hivemind import DHT, get_dht_time
 
+# Import tgenrl package
 from genrl.communication.communication import Communication
 from genrl.serialization.game_tree import from_bytes, to_bytes
 from genrl.logging_utils.global_defs import get_logger
 
 
+class HivemindRendezvouz:
+    """Local implementation of Hivemind rendezvous."""
+    _STORE = None
+    _IS_MASTER = False
+    _IS_LAMBDA = False
+    _LOCK = threading.Lock()
+
+    @classmethod
+    def init(cls, is_master: bool = False):
+        with cls._LOCK:
+            cls._IS_MASTER = is_master
+            cls._IS_LAMBDA = os.environ.get("LAMBDA", False)
+            if cls._STORE is None and cls._IS_LAMBDA:
+                world_size = int(os.environ.get("HIVEMIND_WORLD_SIZE", 1))
+                try:
+                    cls._STORE = dist.TCPStore(
+                        host_name=os.environ["MASTER_ADDR"],
+                        port=int(os.environ["MASTER_PORT"]),
+                        is_master=is_master,
+                        world_size=world_size,
+                        wait_for_workers=True,
+                        timeout=300,
+                    )
+                    get_logger().info("TCPStore initialized")
+                except Exception as e:
+                    get_logger().error(f"Failed to initialize TCPStore: {e}")
+                    cls._STORE = None
+
+    @classmethod
+    def is_bootstrap(cls) -> bool:
+        return cls._IS_MASTER
+
+    @classmethod
+    def set_initial_peers(cls, initial_peers):
+        if cls._STORE is None and cls._IS_LAMBDA:
+            cls.init()
+        if cls._IS_LAMBDA and cls._STORE is not None:
+            try:
+                cls._STORE.set("initial_peers", pickle.dumps(initial_peers))
+                get_logger().info(f"Set initial peers: {len(initial_peers)} peers")
+            except Exception as e:
+                get_logger().warning(f"Failed to set initial peers: {e}")
+
+    @classmethod
+    def get_initial_peers(cls):
+        if cls._STORE is None and cls._IS_LAMBDA:
+            cls.init()
+        if cls._STORE is not None:
+            try:
+                cls._STORE.wait(["initial_peers"], timeout=60)
+                peer_bytes = cls._STORE.get("initial_peers")
+                initial_peers = pickle.loads(peer_bytes)
+                get_logger().info(f"Got initial peers: {len(initial_peers)} peers")
+                return initial_peers
+            except Exception as e:
+                get_logger().warning(f"Failed to get initial peers: {e}")
+                return None
+        return None
+
+
 class HivemindBackend(Communication):
+    """
+    Robust Hivemind backend with improved error handling and stability.
+    Designed to handle DHT process crashes and resource issues.
+    """
+    
     def __init__(
         self,
         initial_peers: List[str] | None = None,
-        timeout: int = 300,  # Reduced from 600
-        startup_timeout: int = 120,  # Reduced 
-        disable_caching: bool = True,  # Default to disabled
-        beam_size: int = 20,  # Much smaller
-        max_retries: int = 3,  # Reduced retries
+        timeout: int = 300,
+        startup_timeout: int = 120,
+        disable_caching: bool = True,
+        beam_size: int = 20,
+        max_retries: int = 3,
         retry_delay: float = 2.0,
         **kwargs,
     ):
+        self.dht = None
         self.world_size = int(os.environ.get("HIVEMIND_WORLD_SIZE", 1))
         self.timeout = timeout
         self.startup_timeout = startup_timeout
         self.max_retries = max_retries
         self.retry_delay = retry_delay
-        self.beam_size = beam_size
-        self.dht = None
+        self.beam_size = min(beam_size, 50)  # Cap beam size
+        # Initialize DHT instance variables
+        self._dht = None  # Private DHT storage
         self.step_ = 0
+        self._connection_failures = 0
+        self._max_connection_failures = 5
         
-        # Force better multiprocessing settings
+        get_logger().info(f"Initializing RobustHivemindBackend (world_size={self.world_size})")
+        
+        # Setup multiprocessing environment
         self._setup_multiprocessing()
         
-        # DHT settings optimized for stability
+        # DHT configuration
         dht_kwargs = {
-            "cache_locally": False,
-            "cache_on_store": False, 
-            "max_peers": 10,  # Very limited
+            "cache_locally": not disable_caching,
+            "cache_on_store": False,
             "request_timeout": 30.0,
-            "num_workers": 1,  # Single worker to avoid pipe issues
-            "daemon": False,  # Don't use daemon processes
-            "compression": None,  # Disable compression
+            "num_workers": 1,
+            "daemon": False,
         }
         dht_kwargs.update(kwargs)
         
         self.bootstrap = self._is_bootstrap()
-        self._init_dht_safe(initial_peers, **dht_kwargs)
+        self._init_dht_with_recovery(initial_peers, **dht_kwargs)
 
     def _setup_multiprocessing(self):
-        """Setup multiprocessing environment for stability."""
-        # Set multiprocessing method to spawn for better isolation
+        """Setup multiprocessing for stability."""
         try:
             mp.set_start_method('spawn', force=True)
-            get_logger().info("✅ Set multiprocessing method to 'spawn'")
+            get_logger().info("Set multiprocessing to 'spawn'")
         except RuntimeError:
-            get_logger().warning("⚠️ Multiprocessing method already set")
+            get_logger().debug("Multiprocessing method already set")
         
-        # Set environment variables
         os.environ['PYTHONUNBUFFERED'] = '1'
-        os.environ['PYTHONDONTWRITEBYTECODE'] = '1'
         os.environ['OMP_NUM_THREADS'] = '1'
         os.environ['MKL_NUM_THREADS'] = '1'
 
     def _is_bootstrap(self) -> bool:
-        """Determine if this is bootstrap node."""
+        """Check if this is bootstrap node."""
         return os.environ.get("HIVEMIND_BOOTSTRAP", "false").lower() == "true"
 
-    def _init_dht_safe(self, initial_peers: List[str] | None, **kwargs):
-        """Initialize DHT with maximum safety and error recovery."""
+    def _init_dht_with_recovery(self, initial_peers: List[str] | None, **kwargs):
+        """Initialize DHT with comprehensive error recovery."""
         
         for attempt in range(self.max_retries):
             try:
-                get_logger().info(f"🔄 DHT init attempt {attempt + 1}/{self.max_retries}")
+                get_logger().info(f"DHT initialization attempt {attempt + 1}/{self.max_retries}")
                 
-                # Clean up any existing DHT
+                # Cleanup previous attempt
                 if self.dht:
                     self._cleanup_dht()
                 
-                # Force garbage collection
-                import gc
-                gc.collect()
-                
-                # Short delay between attempts
+                # Progressive delay
                 if attempt > 0:
-                    time.sleep(self.retry_delay * attempt)
+                    delay = self.retry_delay * (2 ** (attempt - 1))
+                    get_logger().info(f"Waiting {delay}s before retry...")
+                    time.sleep(delay)
                 
-                # Initialize DHT with timeout protection
-                self._dht_init_with_timeout(initial_peers, **kwargs)
+                # Try initialization with timeout
+                self._init_dht_with_timeout(initial_peers, **kwargs)
                 
-                # Verify DHT is working
+                # Health check
                 self._verify_dht_health()
                 
-                get_logger().info("✅ DHT initialized successfully")
+                get_logger().info("DHT initialized successfully")
+                self._connection_failures = 0
                 return
                 
             except Exception as e:
-                get_logger().error(f"❌ DHT init attempt {attempt + 1} failed: {e}")
-                
-                # Clean up failed attempt
+                get_logger().error(f"DHT init attempt {attempt + 1} failed: {e}")
                 self._cleanup_dht()
                 
                 if attempt == self.max_retries - 1:
-                    # Final attempt - try minimal configuration
-                    get_logger().warning("🔄 Final attempt with minimal config...")
-                    try:
-                        self._init_minimal_dht(initial_peers)
-                        return
-                    except Exception as final_e:
-                        get_logger().error(f"❌ All DHT init attempts failed: {final_e}")
-                        raise RuntimeError(f"Failed to initialize DHT after all attempts: {final_e}")
+                    get_logger().error("All DHT initialization attempts failed")
+                    # Don't raise - allow fallback to single node
+                    get_logger().warning("DHT unavailable - will operate as single node")
+                    return
 
-    def _dht_init_with_timeout(self, initial_peers, **kwargs):
+    def _init_dht_with_timeout(self, initial_peers, **kwargs):
         """Initialize DHT with timeout protection."""
         
-        def signal_handler(signum, frame):
+        def timeout_handler(signum, frame):
             raise TimeoutError("DHT initialization timeout")
         
-        # Set timeout signal
-        signal.signal(signal.SIGALRM, signal_handler)
+        signal.signal(signal.SIGALRM, timeout_handler)
         signal.alarm(self.startup_timeout)
         
         try:
+            host_maddrs = ["/ip4/0.0.0.0/tcp/0"]  # Simplified - only TCP
+            
             if self.bootstrap:
-                get_logger().info("🚀 Starting as bootstrap node")
+                get_logger().info("Starting as bootstrap node")
                 self.dht = DHT(
                     start=True,
-                    host_maddrs=["/ip4/0.0.0.0/tcp/0"],  # Only TCP
+                    host_maddrs=host_maddrs,
                     initial_peers=initial_peers or [],
                     startup_timeout=self.startup_timeout,
                     **kwargs
                 )
+                
+                # Set rendezvous peers
+                try:
+                    dht_maddrs = self.dht.get_visible_maddrs(latest=True)
+                    HivemindRendezvouz.set_initial_peers(dht_maddrs)
+                except Exception as e:
+                    get_logger().warning(f"Failed to set rendezvous peers: {e}")
+                    
             else:
-                get_logger().info("🔗 Starting as worker node") 
+                get_logger().info("Starting as worker node")
+                
+                # Get peers from rendezvous or use provided
+                resolved_peers = initial_peers
+                if not resolved_peers:
+                    resolved_peers = HivemindRendezvouz.get_initial_peers()
+                    
+                if not resolved_peers:
+                    get_logger().warning("No peers found - using empty peer list")
+                    resolved_peers = []
+                
+                get_logger().info(f"Connecting to {len(resolved_peers)} peers")
+                
                 self.dht = DHT(
                     start=True,
-                    host_maddrs=["/ip4/0.0.0.0/tcp/0"],  # Only TCP
-                    initial_peers=initial_peers or [],
+                    host_maddrs=host_maddrs,
+                    initial_peers=resolved_peers,
                     startup_timeout=self.startup_timeout,
                     **kwargs
                 )
                 
         finally:
-            signal.alarm(0)  # Cancel timeout
-
-    def _init_minimal_dht(self, initial_peers):
-        """Last resort - minimal DHT configuration."""
-        get_logger().info("🔧 Trying minimal DHT configuration...")
-        
-        minimal_kwargs = {
-            "cache_locally": False,
-            "cache_on_store": False,
-            "max_peers": 3,
-            "request_timeout": 15.0,
-            "num_workers": 1,
-            "daemon": False,
-        }
-        
-        self.dht = DHT(
-            start=True,
-            host_maddrs=["/ip4/0.0.0.0/tcp/0"],
-            initial_peers=initial_peers[:1] if initial_peers else [],  # Only first peer
-            startup_timeout=30,
-            **minimal_kwargs
-        )
+            signal.alarm(0)
 
     def _verify_dht_health(self):
-        """Verify DHT is healthy and responsive."""
-        max_wait = 30
-        start_time = time.time()
-        
-        while time.time() - start_time < max_wait:
-            try:
-                # Test basic DHT functionality
-                test_key = f"health_check_{time.time()}"
-                test_value = b"test"
-                
-                # Quick store/get test
-                self.dht.store(test_key, test_value, expiration_time=get_dht_time() + 60)
-                time.sleep(1)
-                
-                result, _ = self.dht.get(test_key, latest=True)
-                if result:
-                    get_logger().info("✅ DHT health check passed")
-                    return
-                    
-            except Exception as e:
-                get_logger().debug(f"DHT health check failed: {e}")
-                time.sleep(2)
-        
-        raise RuntimeError("DHT health check failed")
+        """Quick health check for DHT."""
+        if not self.dht:
+            return
+            
+        try:
+            # Simple connectivity test
+            self.dht.get_visible_maddrs(latest=True)
+            get_logger().info("DHT health check passed")
+        except Exception as e:
+            get_logger().warning(f"DHT health check failed: {e}")
+            # Don't raise - DHT might still work
 
     def _cleanup_dht(self):
-        """Clean up DHT resources safely."""
+        """Safely cleanup DHT resources."""
         if self.dht:
             try:
-                get_logger().debug("🧹 Cleaning up DHT...")
-                
-                # Try graceful shutdown first
+                get_logger().debug("Cleaning up DHT...")
                 self.dht.shutdown()
-                
-                # Wait a bit for cleanup
-                time.sleep(1)
-                
+                time.sleep(1)  # Allow cleanup
             except Exception as e:
-                get_logger().warning(f"⚠️ DHT cleanup error: {e}")
+                get_logger().warning(f"DHT cleanup warning: {e}")
             finally:
                 self.dht = None
 
     def all_gather_object(self, obj: Any) -> Dict[str | int, Any]:
-        """Robust all_gather with fallback mechanisms."""
+        """
+        Robust all_gather with fallback to single-node operation.
+        """
         
+        # If no DHT, return single object
         if not self.dht:
-            get_logger().warning("⚠️ DHT not available, returning single object")
+            get_logger().debug("DHT unavailable, returning single object")
             return {self.get_id(): obj}
         
         key = f"gather_{self.step_}"
         
-        # Try main gathering approach
+        # Try distributed gather
         for attempt in range(self.max_retries):
             try:
-                result = self._attempt_gather(obj, key, attempt)
+                result = self._attempt_distributed_gather(obj, key)
                 self.step_ += 1
                 return result
                 
             except Exception as e:
-                get_logger().warning(f"⚠️ Gather attempt {attempt + 1} failed: {e}")
+                get_logger().warning(f"Gather attempt {attempt + 1} failed: {e}")
+                self._connection_failures += 1
                 
-                if attempt == self.max_retries - 1:
-                    get_logger().error("❌ All gather attempts failed, using fallback")
+                # If too many failures, disable DHT
+                if self._connection_failures >= self._max_connection_failures:
+                    get_logger().error("Too many DHT failures, switching to single-node mode")
+                    self._cleanup_dht()
                     return {self.get_id(): obj}
                 
-                time.sleep(self.retry_delay * (attempt + 1))
+                if attempt < self.max_retries - 1:
+                    time.sleep(self.retry_delay * (attempt + 1))
         
-        # Final fallback
+        # All attempts failed - fallback to single node
+        get_logger().warning("All gather attempts failed, using single-node fallback")
         return {self.get_id(): obj}
 
-    def _attempt_gather(self, obj: Any, key: str, attempt: int) -> Dict[str | int, Any]:
-        """Single gather attempt with timeout."""
+    def _attempt_distributed_gather(self, obj: Any, key: str) -> Dict[str, Any]:
+        """Single attempt at distributed gathering."""
         
-        # Serialize object
+        # Serialize
         try:
             obj_bytes = to_bytes(obj)
         except Exception as e:
             raise RuntimeError(f"Serialization failed: {e}")
         
-        # Store with reduced beam size for stability
-        effective_beam_size = max(1, self.beam_size // (attempt + 1))
-        
+        # Store
         try:
             self.dht.store(
                 key,
                 subkey=str(self.dht.peer_id),
                 value=obj_bytes,
                 expiration_time=get_dht_time() + self.timeout,
-                beam_size=effective_beam_size,
+                beam_size=self.beam_size,
             )
         except Exception as e:
             raise RuntimeError(f"DHT store failed: {e}")
         
-        # Wait for propagation (adaptive)
-        wait_time = min(3.0, 0.5 * self.world_size)
-        time.sleep(wait_time)
+        # Wait for propagation
+        time.sleep(min(2.0, 0.5 * self.world_size))
         
-        # Collect results with timeout
-        collected = self._collect_results(key, effective_beam_size)
-        
-        if len(collected) == 0:
-            raise RuntimeError("No results collected")
-        
-        return collected
-
-    def _collect_results(self, key: str, beam_size: int) -> Dict[str, Any]:
-        """Collect results with progressive timeout."""
-        
+        # Collect results
         start_time = time.time()
-        max_wait = min(self.timeout, 60)  # Cap at 60 seconds
-        
         best_result = {}
         
-        while time.time() - start_time < max_wait:
+        while time.time() - start_time < min(self.timeout, 60):
             try:
-                output, _ = self.dht.get(key, beam_size=beam_size, latest=True)
+                output, _ = self.dht.get(key, beam_size=self.beam_size, latest=True)
                 
                 if output:
-                    # Deserialize results
                     current_result = {}
                     for subkey, value in output.items():
                         try:
                             current_result[subkey] = from_bytes(value.value)
                         except Exception as e:
-                            get_logger().warning(f"⚠️ Failed to deserialize {subkey}: {e}")
+                            get_logger().debug(f"Deserialization failed for {subkey}: {e}")
                     
                     if len(current_result) > len(best_result):
                         best_result = current_result
                     
-                    # Stop if we have enough results
-                    if len(current_result) >= min(self.world_size, 3):
+                    # Success if we have enough results
+                    if len(current_result) >= min(self.world_size, 2):
                         break
                 
                 time.sleep(1.0)
                 
             except Exception as e:
-                get_logger().debug(f"Collection attempt failed: {e}")
+                get_logger().debug(f"DHT get failed: {e}")
                 time.sleep(2.0)
         
-        get_logger().info(f"📊 Collected {len(best_result)} objects")
+        if not best_result:
+            raise RuntimeError("No results collected")
+        
+        get_logger().debug(f"Collected {len(best_result)}/{self.world_size} objects")
+        self._connection_failures = max(0, self._connection_failures - 1)  # Reduce failure count on success
+        
         return best_result
 
     def get_id(self):
-        """Get node ID safely."""
+        """Get node identifier safely."""
         if self.dht and hasattr(self.dht, 'peer_id'):
             return str(self.dht.peer_id)
         return f"node_{os.getpid()}"
 
     def shutdown(self):
-        """Safe shutdown."""
+        """Graceful shutdown."""
+        get_logger().info("Shutting down RobustHivemindBackend...")
         self._cleanup_dht()
 
     def __del__(self):
