@@ -116,7 +116,6 @@ class HivemindBackend(Communication):
         dht_kwargs = {
             "cache_locally": not disable_caching,
             "cache_on_store": False,
-            "request_timeout": 30.0,
             "num_workers": 1,
             "daemon": False,
         }
