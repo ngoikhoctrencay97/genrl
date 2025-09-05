@@ -11,7 +11,7 @@ from contextlib import contextmanager
 import torch.distributed as dist
 from hivemind import DHT, get_dht_time
 
-# Import tgenrl package
+# Import from genrl package
 from genrl.communication.communication import Communication
 from genrl.serialization.game_tree import from_bytes, to_bytes
 from genrl.logging_utils.global_defs import get_logger
@@ -79,8 +79,8 @@ class HivemindRendezvouz:
 
 class HivemindBackend(Communication):
     """
-    Robust Hivemind backend with improved error handling and stability.
-    Designed to handle DHT process crashes and resource issues.
+    Robust Hivemind backend with persistent identity extraction and single-node optimization.
+    Extracts agent ID from identity file then operates in stable single-node mode.
     """
     
     def __init__(
@@ -94,6 +94,7 @@ class HivemindBackend(Communication):
         retry_delay: float = 2.0,
         **kwargs,
     ):
+        # Initialize core attributes
         self.dht = None
         self.world_size = int(os.environ.get("HIVEMIND_WORLD_SIZE", 1))
         self.timeout = timeout
@@ -101,18 +102,16 @@ class HivemindBackend(Communication):
         self.max_retries = max_retries
         self.retry_delay = retry_delay
         self.beam_size = min(beam_size, 50)  # Cap beam size
-        # Initialize DHT instance variables
-        self._dht = None  # Private DHT storage
         self.step_ = 0
         self._connection_failures = 0
         self._max_connection_failures = 5
         
-        get_logger().info(f"Initializing RobustHivemindBackend (world_size={self.world_size})")
+        get_logger().info(f"Initializing HivemindBackend (world_size={self.world_size})")
         
         # Setup multiprocessing environment
         self._setup_multiprocessing()
         
-        # DHT configuration
+        # DHT configuration - only safe parameters
         dht_kwargs = {
             "cache_locally": not disable_caching,
             "cache_on_store": False,
@@ -140,8 +139,90 @@ class HivemindBackend(Communication):
         """Check if this is bootstrap node."""
         return os.environ.get("HIVEMIND_BOOTSTRAP", "false").lower() == "true"
 
+    def _get_persistent_identity(self, **kwargs):
+        """Extract peer_id from identity file then shutdown DHT immediately."""
+        try:
+            get_logger().info("Extracting persistent identity from file...")
+            
+            # Setup timeout protection
+            def timeout_handler(signum, frame):
+                raise TimeoutError("Identity extraction timeout")
+            
+            signal.signal(signal.SIGALRM, timeout_handler)
+            signal.alarm(30)  # 30 second timeout
+            
+            # Filter to only safe parameters for identity extraction
+            safe_kwargs = {
+                'identity_path': kwargs.get('identity_path'),
+                'cache_locally': False,
+                'cache_on_store': False
+            }
+            safe_kwargs = {k: v for k, v in safe_kwargs.items() if v is not None}
+            
+            get_logger().debug(f"Identity extraction kwargs: {safe_kwargs}")
+            
+            # Create temporary DHT just to extract peer_id
+            temp_dht = DHT(
+                start=True,
+                host_maddrs=["/ip4/0.0.0.0/tcp/0"],
+                initial_peers=[],  # Empty peers - no network needed
+                startup_timeout=20,  # Short timeout
+                **safe_kwargs
+            )
+            
+            # Extract peer_id
+            peer_id = str(temp_dht.peer_id)
+            get_logger().info(f"Successfully extracted peer_id: {peer_id}")
+            
+            # Shutdown immediately to free resources
+            temp_dht.shutdown()
+            get_logger().debug("Temporary DHT shutdown completed")
+            
+            # Clear timeout
+            signal.alarm(0)
+            
+            return peer_id
+            
+        except Exception as e:
+            # Clear timeout on any error
+            signal.alarm(0)
+            get_logger().warning(f"Failed to extract identity: {e}")
+            return None
+    
     def _init_dht_with_recovery(self, initial_peers: List[str] | None, **kwargs):
-        """Initialize DHT with comprehensive error recovery."""
+        """Initialize DHT with persistent identity extraction and comprehensive error recovery."""
+        
+        # Try to extract persistent identity first
+        if 'identity_path' in kwargs and kwargs['identity_path']:
+            identity_path = kwargs['identity_path']
+            get_logger().info(f"Identity file configured: {identity_path}")
+            
+            if os.path.exists(identity_path):
+                get_logger().info("Identity file exists, extracting persistent peer ID...")
+                persistent_id = self._get_persistent_identity(**kwargs)
+                
+                if persistent_id:
+                    self._persistent_peer_id = persistent_id
+                    
+                    # Log successful single-node setup
+                    get_logger().info("=" * 60)
+                    get_logger().info("TRAINING MODE: Single-node with persistent identity")
+                    get_logger().info(f"Agent ID: {persistent_id}")
+                    get_logger().info(f"Identity file: {identity_path}")
+                    get_logger().info("Memory optimization: DHT networking disabled")
+                    get_logger().info("Data consistency: Maintained with existing runs")
+                    get_logger().info("Performance: Optimized for single-node stability")
+                    get_logger().info("=" * 60)
+                    return
+                else:
+                    get_logger().warning("Failed to extract identity, falling back to DHT mode")
+            else:
+                get_logger().warning(f"Identity file not found: {identity_path}")
+        else:
+            get_logger().info("No identity_path configured, attempting DHT mode")
+        
+        # Fallback to distributed DHT mode
+        get_logger().info("Attempting distributed DHT initialization...")
         
         for attempt in range(self.max_retries):
             try:
@@ -163,7 +244,14 @@ class HivemindBackend(Communication):
                 # Health check
                 self._verify_dht_health()
                 
-                get_logger().info("DHT initialized successfully")
+                get_logger().info("=" * 60)
+                get_logger().info("TRAINING MODE: Distributed DHT")
+                get_logger().info(f"Agent ID: {self.dht.peer_id}")
+                get_logger().info(f"Connected peers: {len(initial_peers) if initial_peers else 0}")
+                get_logger().info("Memory usage: Higher due to DHT networking")
+                get_logger().info("Performance: Distributed synchronization active")
+                get_logger().info("=" * 60)
+                
                 self._connection_failures = 0
                 return
                 
@@ -173,8 +261,13 @@ class HivemindBackend(Communication):
                 
                 if attempt == self.max_retries - 1:
                     get_logger().error("All DHT initialization attempts failed")
-                    # Don't raise - allow fallback to single node
-                    get_logger().warning("DHT unavailable - will operate as single node")
+                    get_logger().info("=" * 60)
+                    get_logger().info("TRAINING MODE: Single-node fallback (no persistent identity)")
+                    get_logger().info(f"Agent ID: Will use node_{os.getpid()}")
+                    get_logger().info("Data consistency: WARNING - New agent ID will be generated")
+                    get_logger().info("Memory optimization: DHT disabled")
+                    get_logger().info("Performance: Single-node mode")
+                    get_logger().info("=" * 60)
                     return
 
     def _init_dht_with_timeout(self, initial_peers, **kwargs):
@@ -261,11 +354,14 @@ class HivemindBackend(Communication):
         Robust all_gather with fallback to single-node operation.
         """
         
-        # If no DHT, return single object
+        # Single-node mode
         if not self.dht:
-            get_logger().debug("DHT unavailable, returning single object")
-            return {self.get_id(): obj}
+            agent_id = self.get_id()
+            get_logger().debug(f"Single-node processing (agent: {agent_id})")
+            return {agent_id: obj}
         
+        # Distributed mode
+        get_logger().debug(f"Distributed mode: Gathering from {self.world_size} nodes")
         key = f"gather_{self.step_}"
         
         # Try distributed gather
@@ -354,14 +450,34 @@ class HivemindBackend(Communication):
         return best_result
 
     def get_id(self):
-        """Get node identifier safely."""
+        """Get agent identifier with persistent identity priority."""
+        # Priority 1: Use extracted persistent ID if available
+        if hasattr(self, '_persistent_peer_id'):
+            return self._persistent_peer_id
+        
+        # Priority 2: Use DHT peer_id if running
         if self.dht and hasattr(self.dht, 'peer_id'):
             return str(self.dht.peer_id)
+        
+        # Priority 3: Final fallback
         return f"node_{os.getpid()}"
+
+    def get_training_mode(self) -> str:
+        """Get current training mode for monitoring."""
+        if hasattr(self, '_persistent_peer_id'):
+            return "single_node_persistent"
+        elif self.dht:
+            return "distributed_dht"
+        else:
+            return "single_node_fallback"
+
+    def is_persistent_identity(self) -> bool:
+        """Check if using persistent identity."""
+        return hasattr(self, '_persistent_peer_id')
 
     def shutdown(self):
         """Graceful shutdown."""
-        get_logger().info("Shutting down RobustHivemindBackend...")
+        get_logger().info("Shutting down HivemindBackend...")
         self._cleanup_dht()
 
     def __del__(self):
