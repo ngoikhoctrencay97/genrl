@@ -5,6 +5,7 @@ import random
 import threading
 import signal
 import multiprocessing as mp
+import psutil
 from typing import Any, Dict, List
 from contextlib import contextmanager
 
@@ -79,8 +80,8 @@ class HivemindRendezvouz:
 
 class HivemindBackend(Communication):
     """
-    Robust Hivemind backend with persistent identity extraction and single-node optimization.
-    Extracts agent ID from identity file then operates in stable single-node mode.
+    Time-based DHT backend that switches from distributed to single-node after timeout.
+    Simple and predictable: tries DHT first, then switches to single-node after specified time.
     """
     
     def __init__(
@@ -92,6 +93,7 @@ class HivemindBackend(Communication):
         beam_size: int = 20,
         max_retries: int = 3,
         retry_delay: float = 2.0,
+        dht_timeout_minutes: int = 260,  # 4h 20min default
         **kwargs,
     ):
         # Initialize core attributes
@@ -106,7 +108,18 @@ class HivemindBackend(Communication):
         self._connection_failures = 0
         self._max_connection_failures = 5
         
+        # Time-based management attributes
+        self.dht_timeout_minutes = dht_timeout_minutes
+        self.dht_start_time = None
+        self.time_based_shutdown = False
+        self.time_monitor_thread = None
+        self.shutdown_flag = threading.Event()
+        
+        # Store identity path for later use
+        self.identity_path = kwargs.get('identity_path')
+        
         get_logger().info(f"Initializing HivemindBackend (world_size={self.world_size})")
+        get_logger().info(f"DHT timeout: {dht_timeout_minutes} minutes")
         
         # Setup multiprocessing environment
         self._setup_multiprocessing()
@@ -121,7 +134,8 @@ class HivemindBackend(Communication):
         dht_kwargs.update(kwargs)
         
         self.bootstrap = self._is_bootstrap()
-        self._init_dht_with_recovery(initial_peers, **dht_kwargs)
+        self.initial_peers = initial_peers
+        self._init_dht_with_time_management(initial_peers, **dht_kwargs)
 
     def _setup_multiprocessing(self):
         """Setup multiprocessing for stability."""
@@ -188,41 +202,26 @@ class HivemindBackend(Communication):
             signal.alarm(0)
             get_logger().warning(f"Failed to extract identity: {e}")
             return None
-    
-    def _init_dht_with_recovery(self, initial_peers: List[str] | None, **kwargs):
-        """Initialize DHT with persistent identity extraction and comprehensive error recovery."""
+
+    def _init_dht_with_time_management(self, initial_peers: List[str] | None, **kwargs):
+        """Initialize DHT with time-based switching to single-node."""
         
-        # Try to extract persistent identity first
-        if 'identity_path' in kwargs and kwargs['identity_path']:
-            identity_path = kwargs['identity_path']
-            get_logger().info(f"Identity file configured: {identity_path}")
-            
-            if os.path.exists(identity_path):
-                get_logger().info("Identity file exists, extracting persistent peer ID...")
-                persistent_id = self._get_persistent_identity(**kwargs)
-                
-                if persistent_id:
-                    self._persistent_peer_id = persistent_id
-                    
-                    # Log successful single-node setup
-                    get_logger().info("=" * 60)
-                    get_logger().info("TRAINING MODE: Single-node with persistent identity")
-                    get_logger().info(f"Agent ID: {persistent_id}")
-                    get_logger().info(f"Identity file: {identity_path}")
-                    get_logger().info("Memory optimization: DHT networking disabled")
-                    get_logger().info("Data consistency: Maintained with existing runs")
-                    get_logger().info("Performance: Optimized for single-node stability")
-                    get_logger().info("=" * 60)
-                    return
-                else:
-                    get_logger().warning("Failed to extract identity, falling back to DHT mode")
-            else:
-                get_logger().warning(f"Identity file not found: {identity_path}")
-        else:
-            get_logger().info("No identity_path configured, attempting DHT mode")
-        
-        # Fallback to distributed DHT mode
         get_logger().info("Attempting distributed DHT initialization...")
+        
+        # Try DHT initialization
+        try:
+            self._init_dht_with_recovery(initial_peers, **kwargs)
+            # If successful, DHT is running
+            return
+        except Exception as e:
+            get_logger().error(f"DHT initialization completely failed: {e}")
+        
+        # DHT failed - fallback to single-node with identity
+        get_logger().info("DHT initialization failed, falling back to single-node mode")
+        self._fallback_to_single_node()
+
+    def _init_dht_with_recovery(self, initial_peers: List[str] | None, **kwargs):
+        """Initialize DHT with comprehensive error recovery."""
         
         for attempt in range(self.max_retries):
             try:
@@ -244,12 +243,16 @@ class HivemindBackend(Communication):
                 # Health check
                 self._verify_dht_health()
                 
+                # Record DHT start time and start monitoring
+                self.dht_start_time = time.time()
+                self._start_time_monitoring()
+                
                 get_logger().info("=" * 60)
-                get_logger().info("TRAINING MODE: Distributed DHT")
+                get_logger().info("TRAINING MODE: Distributed DHT with time limit")
                 get_logger().info(f"Agent ID: {self.dht.peer_id}")
                 get_logger().info(f"Connected peers: {len(initial_peers) if initial_peers else 0}")
-                get_logger().info("Memory usage: Higher due to DHT networking")
-                get_logger().info("Performance: Distributed synchronization active")
+                get_logger().info(f"DHT timeout: {self.dht_timeout_minutes} minutes")
+                get_logger().info("Will automatically switch to single-node after timeout")
                 get_logger().info("=" * 60)
                 
                 self._connection_failures = 0
@@ -261,14 +264,97 @@ class HivemindBackend(Communication):
                 
                 if attempt == self.max_retries - 1:
                     get_logger().error("All DHT initialization attempts failed")
-                    get_logger().info("=" * 60)
-                    get_logger().info("TRAINING MODE: Single-node fallback (no persistent identity)")
-                    get_logger().info(f"Agent ID: Will use node_{os.getpid()}")
-                    get_logger().info("Data consistency: WARNING - New agent ID will be generated")
-                    get_logger().info("Memory optimization: DHT disabled")
-                    get_logger().info("Performance: Single-node mode")
-                    get_logger().info("=" * 60)
-                    return
+                    raise RuntimeError("DHT initialization failed after all retries")
+
+    def _start_time_monitoring(self):
+        """Start time monitoring thread to shutdown DHT after timeout."""
+        if self.time_monitor_thread and self.time_monitor_thread.is_alive():
+            return
+            
+        self.shutdown_flag.clear()
+        self.time_monitor_thread = threading.Thread(target=self._time_monitor_loop, daemon=True)
+        self.time_monitor_thread.start()
+        get_logger().info("DHT time monitoring started")
+
+    def _time_monitor_loop(self):
+        """Time monitoring loop - runs in separate thread."""
+        last_log_minute = 0
+        
+        while not self.shutdown_flag.is_set() and self.dht and not self.time_based_shutdown:
+            try:
+                if self.dht_start_time:
+                    elapsed_minutes = (time.time() - self.dht_start_time) / 60
+                    
+                    # Check if timeout reached
+                    if elapsed_minutes >= self.dht_timeout_minutes:
+                        get_logger().info(f"DHT timeout reached: {elapsed_minutes:.1f} minutes")
+                        self._time_based_shutdown()
+                        break
+                    
+                    # Log progress every 30 minutes
+                    current_minute = int(elapsed_minutes)
+                    if current_minute % 30 == 0 and current_minute > last_log_minute and current_minute > 0:
+                        remaining = self.dht_timeout_minutes - elapsed_minutes
+                        get_logger().info(f"DHT runtime: {elapsed_minutes:.1f}min, {remaining:.1f}min remaining")
+                        last_log_minute = current_minute
+                
+            except Exception as e:
+                get_logger().error(f"Error in time monitoring: {e}")
+            
+            # Wait before next check (check every minute)
+            if not self.shutdown_flag.wait(60):
+                continue
+                
+        get_logger().debug("Time monitoring thread stopped")
+
+    def _time_based_shutdown(self):
+        """Shutdown DHT due to time limit and switch to single-node."""
+        get_logger().info("=" * 60)
+        get_logger().info("SCHEDULED DHT SHUTDOWN: Time limit reached")
+        get_logger().info("Switching to single-node mode for long-term stability")
+        get_logger().info("=" * 60)
+        
+        self.time_based_shutdown = True
+        
+        # Shutdown DHT
+        if self.dht:
+            try:
+                self.dht.shutdown()
+                time.sleep(2)  # Allow cleanup
+            except Exception as e:
+                get_logger().error(f"Error during time-based shutdown: {e}")
+            finally:
+                self.dht = None
+        
+        # Stop time monitoring
+        self.shutdown_flag.set()
+        
+        # Setup single-node mode
+        self._fallback_to_single_node()
+
+    def _fallback_to_single_node(self):
+        """Setup single-node mode with persistent identity if possible."""
+        
+        # Try to extract identity if available
+        if self.identity_path and os.path.exists(self.identity_path):
+            get_logger().info("Extracting persistent identity for single-node mode...")
+            persistent_id = self._get_persistent_identity(identity_path=self.identity_path)
+            if persistent_id:
+                self._persistent_peer_id = persistent_id
+                get_logger().info(f"Using persistent identity: {persistent_id}")
+        
+        get_logger().info("=" * 60)
+        get_logger().info("TRAINING MODE: Single-node (post-DHT)")
+        get_logger().info(f"Agent ID: {self.get_id()}")
+        if hasattr(self, '_persistent_peer_id'):
+            get_logger().info("Identity: Persistent from file")
+            get_logger().info("Data consistency: Maintained with previous runs")
+        else:
+            get_logger().info("Identity: Process-based fallback")
+            get_logger().info("Data consistency: New agent ID generated")
+        get_logger().info("Performance: Optimized for long-term stability")
+        get_logger().info("Memory usage: Reduced after DHT shutdown")
+        get_logger().info("=" * 60)
 
     def _init_dht_with_timeout(self, initial_peers, **kwargs):
         """Initialize DHT with timeout protection."""
@@ -339,6 +425,9 @@ class HivemindBackend(Communication):
 
     def _cleanup_dht(self):
         """Safely cleanup DHT resources."""
+        # Stop time monitoring
+        self.shutdown_flag.set()
+        
         if self.dht:
             try:
                 get_logger().debug("Cleaning up DHT...")
@@ -351,11 +440,11 @@ class HivemindBackend(Communication):
 
     def all_gather_object(self, obj: Any) -> Dict[str | int, Any]:
         """
-        Robust all_gather with fallback to single-node operation.
+        Robust all_gather with time-aware fallback to single-node operation.
         """
         
-        # Single-node mode
-        if not self.dht:
+        # Check if time-based shutdown occurred or DHT unavailable
+        if self.time_based_shutdown or not self.dht:
             agent_id = self.get_id()
             get_logger().debug(f"Single-node processing (agent: {agent_id})")
             return {agent_id: obj}
@@ -375,10 +464,10 @@ class HivemindBackend(Communication):
                 get_logger().warning(f"Gather attempt {attempt + 1} failed: {e}")
                 self._connection_failures += 1
                 
-                # If too many failures, disable DHT
+                # If too many failures, trigger early shutdown
                 if self._connection_failures >= self._max_connection_failures:
-                    get_logger().error("Too many DHT failures, switching to single-node mode")
-                    self._cleanup_dht()
+                    get_logger().error("Too many DHT failures, triggering early shutdown")
+                    self._time_based_shutdown()
                     return {self.get_id(): obj}
                 
                 if attempt < self.max_retries - 1:
@@ -464,7 +553,9 @@ class HivemindBackend(Communication):
 
     def get_training_mode(self) -> str:
         """Get current training mode for monitoring."""
-        if hasattr(self, '_persistent_peer_id'):
+        if self.time_based_shutdown:
+            return "single_node_post_timeout"
+        elif hasattr(self, '_persistent_peer_id') and not self.dht:
             return "single_node_persistent"
         elif self.dht:
             return "distributed_dht"
@@ -475,10 +566,54 @@ class HivemindBackend(Communication):
         """Check if using persistent identity."""
         return hasattr(self, '_persistent_peer_id')
 
+    def get_time_status(self) -> Dict[str, Any]:
+        """Get DHT time status information."""
+        if self.dht_start_time:
+            elapsed_minutes = (time.time() - self.dht_start_time) / 60
+            remaining_minutes = max(0, self.dht_timeout_minutes - elapsed_minutes)
+        else:
+            elapsed_minutes = 0
+            remaining_minutes = 0
+            
+        return {
+            "dht_active": self.dht is not None,
+            "time_based_shutdown": self.time_based_shutdown,
+            "elapsed_minutes": round(elapsed_minutes, 1),
+            "remaining_minutes": round(remaining_minutes, 1),
+            "timeout_minutes": self.dht_timeout_minutes,
+            "monitoring_active": self.time_monitor_thread and self.time_monitor_thread.is_alive()
+        }
+
+    def extend_dht_timeout(self, additional_minutes: int):
+        """Extend DHT timeout by additional minutes (if still running)."""
+        if self.dht and not self.time_based_shutdown:
+            self.dht_timeout_minutes += additional_minutes
+            get_logger().info(f"DHT timeout extended by {additional_minutes} minutes")
+            get_logger().info(f"New timeout: {self.dht_timeout_minutes} minutes")
+        else:
+            get_logger().warning("Cannot extend timeout: DHT not running or already shutdown")
+
+    def force_single_node_switch(self):
+        """Manually trigger switch to single-node mode."""
+        if self.dht and not self.time_based_shutdown:
+            get_logger().info("Manual switch to single-node mode triggered")
+            self._time_based_shutdown()
+        else:
+            get_logger().info("Already in single-node mode")
+
     def shutdown(self):
         """Graceful shutdown."""
         get_logger().info("Shutting down HivemindBackend...")
+        
+        # Stop time monitoring
+        self.shutdown_flag.set()
+        
+        # Cleanup DHT
         self._cleanup_dht()
+        
+        # Wait for monitor thread to finish
+        if self.time_monitor_thread and self.time_monitor_thread.is_alive():
+            self.time_monitor_thread.join(timeout=5)
 
     def __del__(self):
         """Cleanup on destruction."""
