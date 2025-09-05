@@ -89,7 +89,7 @@ class HivemindBackend(Communication):
         beam_size: int = 20,
         max_retries: int = 3,
         retry_delay: float = 2.0,
-        dht_timeout_minutes: int = 5,  # 5 minutes for testing
+        dht_timeout_minutes: int = 260,  # 5 minutes for testing
         **kwargs,
     ):
         # Core attributes
