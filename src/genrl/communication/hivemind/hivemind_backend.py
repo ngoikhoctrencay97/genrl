@@ -232,14 +232,13 @@ class HivemindBackend(Communication):
         get_logger().info("=" * 60)
         get_logger().info("DHT TIMEOUT: Preserving identity and switching to single-node")
         get_logger().info("=" * 60)
+        # Mark as time-based shutdown
+        self.time_based_shutdown = True
         
         # PRESERVE peer_id BEFORE shutdown
         if self.dht and hasattr(self.dht, 'peer_id'):
             self._persistent_peer_id = str(self.dht.peer_id)
             get_logger().info(f"Preserved peer_id: {self._persistent_peer_id}")
-        
-        # Mark as time-based shutdown
-        self.time_based_shutdown = True
         
         # Shutdown DHT
         if self.dht:
@@ -247,8 +246,6 @@ class HivemindBackend(Communication):
                 self.dht.shutdown()
                 time.sleep(2)
                 get_logger().info("DHT shutdown completed")
-            except Exception as e:
-                get_logger().error(f"Error during shutdown: {e}")
             finally:
                 self.dht = None
         
@@ -336,9 +333,11 @@ class HivemindBackend(Communication):
     def all_gather_object(self, obj: Any) -> Dict[str | int, Any]:
         """Gather objects with time-aware fallback."""
         
-        if self.time_based_shutdown or not self.dht:
+        if (self.time_based_shutdown or 
+            not self.dht or 
+            not hasattr(self.dht, 'peer_id')):
             agent_id = self.get_id()
-            get_logger().debug(f"Single-node processing (agent: {agent_id})")
+            get_logger().info(f"FORCED single-node processing (agent: {agent_id})")
             return {agent_id: obj}
         
         key = f"gather_{self.step_}"
