@@ -130,6 +130,7 @@ class HivemindBackend(Communication):
         
         self.bootstrap = self._is_bootstrap()
         self._init_dht_or_fallback(initial_peers, **dht_kwargs)
+        self._pending_shutdown = False
 
     def _setup_multiprocessing(self):
         """Setup multiprocessing for stability."""
@@ -214,6 +215,7 @@ class HivemindBackend(Communication):
                 elapsed_minutes = (time.time() - self.dht_start_time) / 60
                 
                 if elapsed_minutes >= self.dht_timeout_minutes:
+                    self._pending_shutdown = True
                     get_logger().info(f"DHT timeout reached: {elapsed_minutes:.1f} minutes")
                     self._preserve_peer_id_and_shutdown()
                     break
@@ -229,6 +231,7 @@ class HivemindBackend(Communication):
 
     def _preserve_peer_id_and_shutdown(self):
         """Preserve peer_id before shutting down DHT."""
+        self._pending_shutdown = False
         get_logger().info("=" * 60)
         get_logger().info("DHT TIMEOUT: Preserving identity and switching to single-node")
         get_logger().info("=" * 60)
@@ -332,6 +335,10 @@ class HivemindBackend(Communication):
 
     def all_gather_object(self, obj: Any) -> Dict[str | int, Any]:
         """Gather objects with time-aware fallback."""
+        if hasattr(self, '_pending_shutdown') and self._pending_shutdown:
+            get_logger().info("Pending shutdown detected - switching to single-node")
+            self._preserve_peer_id_and_shutdown()
+            return {self.get_id(): obj}
         
         if (self.time_based_shutdown or 
             not self.dht or 
