@@ -23,7 +23,7 @@ class TrainingPhase(Enum):
     DATA_LOADING = "data_loading"
     FORWARD_PASS = "forward_pass"
     BACKWARD_PASS = "backward_pass" 
-    GRADIENT_SYNC = "gradient_sync"   
+    GRADIENT_SYNC = "gradient_sync"
     MODEL_UPDATE = "model_update"
     EVALUATION = "evaluation"
     BLOCKCHAIN_SUBMIT = "blockchain_submit"
@@ -47,7 +47,7 @@ class TrainingStateManager:
         self._restart_requested = False
         self._restart_reason = ""
         self._last_restart_time = 0
-        self._restart_cooldown = 300 
+        self._restart_cooldown = 300
         
         # Statistics
         self._phase_durations = defaultdict(list)
@@ -554,7 +554,7 @@ class HivemindBackend(Communication):
             except Exception as e:
                 get_logger().warning(f"Auto-restart monitor error: {e}")
                 
-            self.shutdown_flag.wait(600)  # Check every minute
+            self.shutdown_flag.wait(60)  # Check every minute
 
     def _check_memory_pressure(self) -> bool:
         """Check if memory usage is too high"""
@@ -741,7 +741,7 @@ class HivemindBackend(Communication):
                     get_logger().info(f"DHT runtime: {elapsed_minutes:.1f}min, {remaining:.1f}min remaining")
                     last_log_minute = current_minute
             
-            self.shutdown_flag.wait(300)
+            self.shutdown_flag.wait(30)
 
     def _health_monitor_loop(self):
         """Monitor DHT process health and detect pipe failures."""
@@ -773,7 +773,7 @@ class HivemindBackend(Communication):
             except Exception as e:
                 get_logger().warning(f"Health monitor error: {e}")
                 
-            self.shutdown_flag.wait(100)
+            self.shutdown_flag.wait(10)
 
     def _check_dht_health(self) -> bool:
         """Comprehensive DHT health check."""
@@ -1178,12 +1178,12 @@ class HivemindBackend(Communication):
     def get_auto_restart_status(self) -> Dict[str, Any]:
         """Get auto-restart status"""
         return {
-            "enabled": self.auto_restart_enabled,
-            "restart_count": self._auto_restart_count,
-            "max_restarts": self.max_auto_restarts,
-            "last_restart_time": self._last_auto_restart,
-            "memory_threshold_mb": self.memory_threshold_mb,
-            "restart_interval_minutes": self.restart_interval_minutes,
+            "enabled": bool(self.auto_restart_enabled),
+            "restart_count": int(self._auto_restart_count),
+            "max_restarts": int(self.max_auto_restarts),
+            "last_restart_time": float(self._last_auto_restart),
+            "memory_threshold_mb": float(self.memory_threshold_mb),
+            "restart_interval_minutes": float(self.restart_interval_minutes),
             "has_training_state_manager": self._training_state_manager is not None,
         }
 
