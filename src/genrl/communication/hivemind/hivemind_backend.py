@@ -3,9 +3,11 @@ import pickle
 import time
 import threading
 import multiprocessing as mp
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional, Callable
+from collections import defaultdict
 import signal
 import sys
+from enum import Enum
 
 import torch.distributed as dist
 from hivemind import DHT, get_dht_time
@@ -14,6 +16,156 @@ from hivemind import DHT, get_dht_time
 from genrl.communication.communication import Communication
 from genrl.serialization.game_tree import from_bytes, to_bytes
 from genrl.logging_utils.global_defs import get_logger
+
+
+class TrainingPhase(Enum):
+    IDLE = "idle"
+    DATA_LOADING = "data_loading"
+    FORWARD_PASS = "forward_pass"
+    BACKWARD_PASS = "backward_pass" 
+    GRADIENT_SYNC = "gradient_sync"   
+    MODEL_UPDATE = "model_update"
+    EVALUATION = "evaluation"
+    BLOCKCHAIN_SUBMIT = "blockchain_submit"
+    PRG_GAME = "prg_game"
+
+
+class TrainingStateManager:
+    """Thread-safe training state manager DHT management"""
+    
+    def __init__(self):
+        self._lock = threading.RLock()
+        self._phase = TrainingPhase.IDLE
+        self._step = 0
+        self._round = 0
+        
+        # Critical section tracking
+        self._gradient_sync_active = False
+        self._blockchain_submit_active = False
+        
+        # DHT restart control
+        self._restart_requested = False
+        self._restart_reason = ""
+        self._last_restart_time = 0
+        self._restart_cooldown = 300 
+        
+        # Statistics
+        self._phase_durations = defaultdict(list)
+        self._total_restarts = 0
+        self._emergency_activations = 0
+        
+    def get_current_phase(self) -> TrainingPhase:
+        with self._lock:
+            return self._phase
+            
+    def set_phase(self, phase: TrainingPhase):
+        """Set current training phase with timing"""
+        with self._lock:
+            old_phase = self._phase
+            self._phase = phase
+            
+            if old_phase != phase:
+                get_logger().debug(f"Training phase: {old_phase.value} → {phase.value}")
+                
+    def enter_critical_section(self, section_type: str):
+        """Enter critical section where DHT restart is forbidden"""
+        with self._lock:
+            if section_type == "gradient_sync":
+                self._gradient_sync_active = True
+                self._phase = TrainingPhase.GRADIENT_SYNC
+            elif section_type == "blockchain_submit":
+                self._blockchain_submit_active = True
+                self._phase = TrainingPhase.BLOCKCHAIN_SUBMIT
+                
+            get_logger().debug(f"Entered critical section: {section_type}")
+            
+    def exit_critical_section(self, section_type: str):
+        """Exit critical section"""
+        with self._lock:
+            if section_type == "gradient_sync":
+                self._gradient_sync_active = False
+            elif section_type == "blockchain_submit":
+                self._blockchain_submit_active = False
+                
+            self._phase = TrainingPhase.IDLE
+            get_logger().debug(f"Exited critical section: {section_type}")
+            
+    def can_restart_dht(self) -> tuple[bool, str]:
+        """Check if safe to restart DHT"""
+        with self._lock:
+            # Check cooldown
+            if time.time() - self._last_restart_time < self._restart_cooldown:
+                remaining = self._restart_cooldown - (time.time() - self._last_restart_time)
+                return False, f"Restart cooldown: {remaining:.0f}s remaining"
+            
+            # Check critical sections
+            if self._gradient_sync_active:
+                return False, "Gradient sync in progress"
+                
+            if self._blockchain_submit_active:
+                return False, "Blockchain submit in progress"
+                
+            # Check safe phases
+            safe_phases = [
+                TrainingPhase.IDLE,
+                TrainingPhase.DATA_LOADING,
+                TrainingPhase.FORWARD_PASS,
+                TrainingPhase.EVALUATION
+            ]
+            
+            if self._phase not in safe_phases:
+                return False, f"Unsafe phase: {self._phase.value}"
+                
+            return True, "Safe to restart"
+            
+    def request_restart(self, reason: str) -> bool:
+        """Request DHT restart"""
+        with self._lock:
+            can_restart, status = self.can_restart_dht()
+            
+            if can_restart:
+                self._restart_requested = True
+                self._restart_reason = reason
+                get_logger().info(f"DHT restart requested: {reason}")
+                return True
+            else:
+                get_logger().warning(f"DHT restart denied: {status}")
+                return False
+                
+    def acknowledge_restart(self):
+        """Acknowledge that restart was completed"""
+        with self._lock:
+            self._restart_requested = False
+            self._restart_reason = ""
+            self._last_restart_time = time.time()
+            self._total_restarts += 1
+            
+    def wait_for_safe_restart_window(self, timeout: float = 60.0) -> bool:
+        """Wait for safe restart window"""
+        start_time = time.time()
+        
+        while time.time() - start_time < timeout:
+            can_restart, _ = self.can_restart_dht()
+            if can_restart:
+                return True
+            time.sleep(0.5)
+            
+        return False
+        
+    def get_stats(self) -> Dict[str, Any]:
+        """Get training state statistics"""
+        with self._lock:
+            return {
+                "current_phase": self._phase.value,
+                "step": self._step,
+                "round": self._round,
+                "total_restarts": self._total_restarts,
+                "emergency_activations": self._emergency_activations,
+                "gradient_sync_active": self._gradient_sync_active,
+                "blockchain_submit_active": self._blockchain_submit_active,
+                "restart_requested": self._restart_requested,
+                "restart_reason": self._restart_reason,
+            }
 
 
 class HivemindRendezvouz:
@@ -131,8 +283,8 @@ class EmergencyTrainingWrapper:
 
 class HivemindBackend(Communication):
     """
-    Robust DHT backend that handles 'Ran out of input' errors gracefully.
-    Features comprehensive error recovery and emergency fallbacks.
+    Enhanced DHT backend with comprehensive auto-restart and crash protection.
+    Features automatic memory monitoring, health checks, and coordinated restarts.
     """
     
     def __init__(
@@ -145,10 +297,15 @@ class HivemindBackend(Communication):
         max_retries: int = 3,
         retry_delay: float = 2.0,
         dht_timeout_minutes: int = 260,
-        # NEW: Enhanced error handling parameters
+        # Enhanced error handling parameters
         enable_robust_mode: bool = True,
         max_pipe_errors: int = 5,
         health_check_interval: int = 30,
+        # NEW: Auto-restart parameters
+        auto_restart_enabled: bool = True,
+        memory_threshold_mb: int = 1800,
+        restart_interval_minutes: int = 45,
+        max_auto_restarts: int = 15,
         **kwargs,
     ):
         # Core attributes
@@ -171,20 +328,36 @@ class HivemindBackend(Communication):
         self._last_health_check = 0
         self._emergency_mode = False
         
+        # NEW: Auto-restart features
+        self.auto_restart_enabled = auto_restart_enabled
+        self.memory_threshold_mb = memory_threshold_mb
+        self.restart_interval_minutes = restart_interval_minutes
+        self.max_auto_restarts = max_auto_restarts
+        
+        # Auto-restart state
+        self._auto_restart_count = 0
+        self._last_auto_restart = 0
+        self._restart_callback: Optional[Callable] = None
+        self._training_state_manager: Optional[TrainingStateManager] = None
+        
         # Time management
         self.dht_timeout_minutes = dht_timeout_minutes
         self.dht_start_time = None
         self.time_based_shutdown = False
         self.time_monitor_thread = None
         self.health_monitor_thread = None
+        self._memory_monitor_thread = None
+        self._auto_restart_thread = None
         self.shutdown_flag = threading.Event()
         
         # Store for later use
         self.initial_peers = initial_peers
         
-        get_logger().info(f"Initializing HivemindBackend (world_size={self.world_size})")
+        get_logger().info(f"Initializing Enhanced HivemindBackend (world_size={self.world_size})")
+        get_logger().info(f"Auto-restart: {auto_restart_enabled}")
+        get_logger().info(f"Memory threshold: {memory_threshold_mb}MB")
+        get_logger().info(f"Restart interval: {restart_interval_minutes}min")
         get_logger().info(f"DHT timeout: {dht_timeout_minutes} minutes")
-        get_logger().info(f"Robust mode: {enable_robust_mode}")
         
         self._setup_multiprocessing()
         
@@ -193,13 +366,23 @@ class HivemindBackend(Communication):
             "cache_locally": not disable_caching,
             "cache_on_store": False,
             "num_workers": 1,
-            "daemon": True,  # Better cleanup
+            "daemon": True,
         }
         dht_kwargs.update(kwargs)
         
         self.bootstrap = self._is_bootstrap()
         self._init_dht_or_fallback(initial_peers, **dht_kwargs)
         self._pending_shutdown = False
+
+    def register_training_state_manager(self, state_manager: TrainingStateManager):
+        """Register external training state manager for coordination"""
+        self._training_state_manager = state_manager
+        get_logger().info("Training state manager registered with DHT backend")
+
+    def set_restart_callback(self, callback_func: Callable[[str, str], None]):
+        """Set callback function to notify when restart events occur"""
+        self._restart_callback = callback_func
+        get_logger().info("DHT restart callback registered")
 
     def _setup_multiprocessing(self):
         """Setup multiprocessing for stability."""
@@ -260,11 +443,16 @@ class HivemindBackend(Communication):
                 self.dht_start_time = time.time()
                 self._start_monitoring()
                 
+                # Start auto-restart monitoring if enabled
+                if self.auto_restart_enabled:
+                    self._start_auto_restart_monitoring()
+                
                 get_logger().info("=" * 60)
-                get_logger().info("TRAINING MODE: Distributed DHT (Robust)")
+                get_logger().info("TRAINING MODE: Distributed DHT (Enhanced)")
                 get_logger().info(f"Agent ID: {self.dht.peer_id}")
+                get_logger().info(f"Auto-restart: {'ENABLED' if self.auto_restart_enabled else 'DISABLED'}")
+                get_logger().info(f"Memory threshold: {self.memory_threshold_mb}MB")
                 get_logger().info(f"DHT timeout: {self.dht_timeout_minutes} minutes")
-                get_logger().info("Error recovery: ENABLED")
                 get_logger().info("=" * 60)
                 
                 self._connection_failures = 0
@@ -301,6 +489,237 @@ class HivemindBackend(Communication):
         self.health_monitor_thread = threading.Thread(target=self._health_monitor_loop, daemon=True)
         self.health_monitor_thread.start()
 
+    def _start_auto_restart_monitoring(self):
+        """Start automatic restart monitoring threads"""
+        if not self.auto_restart_enabled:
+            return
+            
+        # Memory monitoring thread
+        if not self._memory_monitor_thread or not self._memory_monitor_thread.is_alive():
+            self._memory_monitor_thread = threading.Thread(
+                target=self._memory_monitor_loop,
+                daemon=True,
+                name="DHT-MemoryMonitor"
+            )
+            self._memory_monitor_thread.start()
+            
+        # Auto restart monitoring thread  
+        if not self._auto_restart_thread or not self._auto_restart_thread.is_alive():
+            self._auto_restart_thread = threading.Thread(
+                target=self._auto_restart_monitor_loop,
+                daemon=True,
+                name="DHT-AutoRestart"
+            )
+            self._auto_restart_thread.start()
+            
+        get_logger().info("Auto-restart monitoring started")
+
+    def _memory_monitor_loop(self):
+        """Monitor memory usage and trigger restart when needed"""
+        last_log_time = 0
+        
+        while not self.shutdown_flag.is_set() and self.auto_restart_enabled:
+            try:
+                if self._check_memory_pressure():
+                    self._request_auto_restart("High memory usage detected")
+                    
+                # Log memory status every 10 minutes
+                current_time = time.time()
+                if current_time - last_log_time > 600:  # 10 minutes
+                    try:
+                        import psutil
+                        memory_mb = psutil.Process().memory_info().rss / 1024 / 1024
+                        get_logger().debug(f"Memory usage: {memory_mb:.1f}MB (threshold: {self.memory_threshold_mb}MB)")
+                        last_log_time = current_time
+                    except:
+                        pass
+                    
+            except Exception as e:
+                get_logger().warning(f"Memory monitor error: {e}")
+                
+            self.shutdown_flag.wait(30)  # Check every 30 seconds
+
+    def _auto_restart_monitor_loop(self):
+        """Monitor for periodic restart needs"""
+        while not self.shutdown_flag.is_set() and self.auto_restart_enabled:
+            try:
+                # Check if periodic restart is needed
+                if self._should_auto_restart():
+                    self._request_auto_restart("Periodic restart to prevent memory leaks")
+                    
+                # Check DHT health
+                if not self._check_dht_health_simple():
+                    self._request_auto_restart("DHT health check failed")
+                    
+            except Exception as e:
+                get_logger().warning(f"Auto-restart monitor error: {e}")
+                
+            self.shutdown_flag.wait(600)  # Check every minute
+
+    def _check_memory_pressure(self) -> bool:
+        """Check if memory usage is too high"""
+        try:
+            import psutil
+            process = psutil.Process()
+            memory_mb = process.memory_info().rss / 1024 / 1024
+            
+            if memory_mb > self.memory_threshold_mb:
+                get_logger().warning(f"High memory usage: {memory_mb:.1f}MB (threshold: {self.memory_threshold_mb}MB)")
+                return True
+                
+        except Exception as e:
+            get_logger().debug(f"Memory check failed: {e}")
+            
+        return False
+
+    def _should_auto_restart(self) -> bool:
+        """Check if periodic restart is needed"""
+        if not self.dht_start_time:
+            return False
+            
+        runtime_minutes = (time.time() - self.dht_start_time) / 60
+        
+        # Check if it's time for periodic restart
+        if runtime_minutes > self.restart_interval_minutes:
+            return True
+            
+        return False
+
+    def _check_dht_health_simple(self) -> bool:
+        """Simple DHT health check"""
+        if not self.dht:
+            return False
+            
+        try:
+            # Test basic DHT operation
+            self.dht.get_visible_maddrs(latest=True)
+            
+            # Check process health
+            if hasattr(self.dht, '_server_process'):
+                if not self.dht._server_process.is_alive():
+                    return False
+                    
+            # Check pipe health
+            if hasattr(self.dht, '_outer_pipe'):
+                if self.dht._outer_pipe.closed:
+                    return False
+                    
+            return True
+            
+        except Exception as e:
+            error_msg = str(e).lower()
+            critical_patterns = [
+                "ran out of input", "pipe", "broken", "connection",
+                "timeout", "eof", "resource temporarily unavailable"
+            ]
+            
+            if any(pattern in error_msg for pattern in critical_patterns):
+                get_logger().warning(f"DHT health issue: {e}")
+                return False
+                
+        return True
+
+    def _request_auto_restart(self, reason: str):
+        """Request automatic restart"""
+        
+        # Check restart limits
+        if self._auto_restart_count >= self.max_auto_restarts:
+            get_logger().error(f"Maximum auto-restarts reached ({self.max_auto_restarts})")
+            self._emergency_mode = True
+            return
+            
+        # Check cooldown (minimum 5 minutes between restarts)
+        if time.time() - self._last_auto_restart < 300:
+            get_logger().debug("Auto-restart cooldown active")
+            return
+            
+        get_logger().info(f"Auto-restart requested: {reason}")
+        
+        # Check if we have training state manager for coordination
+        if self._training_state_manager:
+            success = self._training_state_manager.request_restart(reason)
+            if success:
+                get_logger().info("Auto-restart approved by training state manager")
+                return
+            else:
+                get_logger().warning("Training state manager denied restart - enabling emergency mode")
+                self._emergency_mode = True
+                return
+        
+        # No training state manager - perform immediate restart (risky!)
+        get_logger().warning("No training state manager - performing immediate restart")
+        self._perform_immediate_restart(reason)
+
+    def _perform_immediate_restart(self, reason: str):
+        """Perform immediate DHT restart (use with caution)"""
+        get_logger().warning(f"Performing immediate DHT restart: {reason}")
+        
+        try:
+            self.perform_coordinated_restart(reason)
+                    
+        except Exception as e:
+            get_logger().error(f"Immediate restart failed: {e}")
+            self._emergency_mode = True
+
+    def perform_coordinated_restart(self, reason: str):
+        """
+        PUBLIC METHOD: Perform restart coordinated by external state manager
+        This is called by TrainingStateManager when it's safe to restart
+        """
+        get_logger().info(f"Performing coordinated DHT restart: {reason}")
+        
+        try:
+            # Preserve critical state
+            old_peer_id = self.get_id()
+            old_step = self.step_
+            
+            get_logger().info(f"Restarting DHT process (step={old_step}, peer={old_peer_id})")
+            
+            # Shutdown current DHT
+            self._preserve_peer_id_and_shutdown()
+            
+            # Brief pause for cleanup
+            time.sleep(5)
+            
+            # Restart with fresh process
+            self.time_based_shutdown = False
+            self._init_dht_or_fallback(self.initial_peers)
+            
+            # Restore state
+            self.step_ = old_step
+            self._auto_restart_count += 1
+            self._last_auto_restart = time.time()
+            
+            get_logger().info(f"DHT restart successful: {old_peer_id} → {self.get_id()}")
+            
+            # Notify callback
+            if self._restart_callback:
+                try:
+                    self._restart_callback("restart_completed", reason)
+                except Exception as e:
+                    get_logger().warning(f"Restart callback error: {e}")
+                    
+            # Reset error counters on successful restart
+            self._connection_failures = 0
+            self._pipe_errors = 0
+            
+            # Restart monitoring if needed
+            if self.auto_restart_enabled:
+                self._start_auto_restart_monitoring()
+            
+        except Exception as e:
+            get_logger().error(f"Coordinated restart failed: {e}")
+            get_logger().exception("Restart failure details:")
+            
+            # Enable emergency mode
+            self._emergency_mode = True
+            
+            if self._restart_callback:
+                try:
+                    self._restart_callback("restart_failed", f"Restart failed: {e}")
+                except Exception as callback_error:
+                    get_logger().warning(f"Restart failure callback error: {callback_error}")
+
     def _time_monitor_loop(self):
         """Monitor DHT runtime and shutdown after timeout."""
         last_log_minute = 0
@@ -322,7 +741,7 @@ class HivemindBackend(Communication):
                     get_logger().info(f"DHT runtime: {elapsed_minutes:.1f}min, {remaining:.1f}min remaining")
                     last_log_minute = current_minute
             
-            self.shutdown_flag.wait(30)
+            self.shutdown_flag.wait(300)
 
     def _health_monitor_loop(self):
         """Monitor DHT process health and detect pipe failures."""
@@ -354,7 +773,7 @@ class HivemindBackend(Communication):
             except Exception as e:
                 get_logger().warning(f"Health monitor error: {e}")
                 
-            self.shutdown_flag.wait(10)  # Check every 10 seconds
+            self.shutdown_flag.wait(100)
 
     def _check_dht_health(self) -> bool:
         """Comprehensive DHT health check."""
@@ -362,7 +781,6 @@ class HivemindBackend(Communication):
             return False
             
         try:
-            # Try to get visible addresses - this tests basic DHT functionality
             self.dht.get_visible_maddrs(latest=True)
             return True
         except Exception as e:
@@ -380,7 +798,9 @@ class HivemindBackend(Communication):
             self._preserve_peer_id_and_shutdown()
         else:
             get_logger().info("Attempting recovery from critical failure")
-            # Trigger recovery in next gather call
+            # Request restart instead of immediate action
+            if self.auto_restart_enabled:
+                self._request_auto_restart(f"Critical failure: {reason}")
 
     def _preserve_peer_id_and_shutdown(self):
         """Preserve peer_id before shutting down DHT."""
@@ -519,7 +939,7 @@ class HivemindBackend(Communication):
             self.dht = None
 
     def all_gather_object(self, obj: Any) -> Dict[str | int, Any]:
-        """Ultra-robust all_gather with comprehensive error handling."""
+        """Enhanced all_gather with comprehensive error handling and restart integration."""
         
         # EMERGENCY EXIT: Force single-node via environment
         if os.environ.get("FORCE_SINGLE_NODE", "false").lower() == "true":
@@ -537,6 +957,14 @@ class HivemindBackend(Communication):
             self._preserve_peer_id_and_shutdown()
             return {self.get_id(): obj}
         
+        # Check if coordinated restart is requested via training state manager
+        if (self._training_state_manager and 
+            hasattr(self._training_state_manager, '_restart_requested') and
+            self._training_state_manager._restart_requested):
+            
+            get_logger().info("DHT restart requested - will be handled by training state manager")
+            # Don't perform restart here - let training state manager coordinate it
+        
         # NO DHT: Use single-node mode
         if (self.time_based_shutdown or 
             not self.dht or 
@@ -545,7 +973,7 @@ class HivemindBackend(Communication):
             get_logger().debug(f"Single-node processing (agent: {agent_id})")
             return {agent_id: obj}
         
-        # DISTRIBUTED GATHERING with error recovery
+        # DISTRIBUTED GATHERING with enhanced error recovery
         key = f"gather_{self.step_}"
         
         for attempt in range(self.max_retries):
@@ -572,7 +1000,13 @@ class HivemindBackend(Communication):
                 
                 if any(pattern in error_msg.lower() for pattern in critical_patterns):
                     get_logger().error(f"Critical DHT error: {error_msg}")
-                    self._handle_critical_failure(f"Gather error: {error_msg}")
+                    
+                    # Request restart for next iteration
+                    if self.auto_restart_enabled:
+                        self._request_auto_restart(f"All-gather critical error: {e}")
+                    else:
+                        self._handle_critical_failure(f"Gather error: {error_msg}")
+                    
                     return {self.get_id(): obj}
                 
                 self._connection_failures += 1
@@ -723,7 +1157,7 @@ class HivemindBackend(Communication):
         elif self.time_based_shutdown:
             return "single_node_post_timeout"
         elif self.dht:
-            return "distributed_dht_robust"
+            return "distributed_dht_enhanced"
         else:
             return "single_node_fallback"
 
@@ -737,7 +1171,20 @@ class HivemindBackend(Communication):
             "pipe_errors": self._pipe_errors,
             "connection_failures": self._connection_failures,
             "robust_mode": self.enable_robust_mode,
+            "auto_restart": self.get_auto_restart_status(),
             "time_status": self.get_time_status(),
+        }
+
+    def get_auto_restart_status(self) -> Dict[str, Any]:
+        """Get auto-restart status"""
+        return {
+            "enabled": self.auto_restart_enabled,
+            "restart_count": self._auto_restart_count,
+            "max_restarts": self.max_auto_restarts,
+            "last_restart_time": self._last_auto_restart,
+            "memory_threshold_mb": self.memory_threshold_mb,
+            "restart_interval_minutes": self.restart_interval_minutes,
+            "has_training_state_manager": self._training_state_manager is not None,
         }
 
     def get_time_status(self) -> Dict[str, Any]:
@@ -758,23 +1205,31 @@ class HivemindBackend(Communication):
         }
 
     def shutdown(self):
-        """Graceful shutdown with comprehensive cleanup."""
-        get_logger().info("Initiating HivemindBackend shutdown...")
+        """Enhanced shutdown with comprehensive cleanup."""
+        get_logger().info("Initiating Enhanced HivemindBackend shutdown...")
         
-        # Set shutdown flag first
+        # Disable auto-restart first
+        self.auto_restart_enabled = False
+        
+        # Set shutdown flag
         self.shutdown_flag.set()
         
-        # Wait for monitoring threads to finish
-        if self.time_monitor_thread and self.time_monitor_thread.is_alive():
-            self.time_monitor_thread.join(timeout=5)
-            
-        if self.health_monitor_thread and self.health_monitor_thread.is_alive():
-            self.health_monitor_thread.join(timeout=5)
+        # Wait for all monitoring threads to finish
+        threads_to_join = [
+            self.time_monitor_thread,
+            self.health_monitor_thread,
+            self._memory_monitor_thread,
+            self._auto_restart_thread
+        ]
+        
+        for thread in threads_to_join:
+            if thread and thread.is_alive():
+                thread.join(timeout=5)
         
         # Clean up DHT
         self._safe_cleanup_dht()
         
-        get_logger().info("HivemindBackend shutdown completed")
+        get_logger().info("Enhanced HivemindBackend shutdown completed")
 
     def __del__(self):
         """Enhanced destructor with error suppression."""
@@ -782,17 +1237,17 @@ class HivemindBackend(Communication):
             self.shutdown()
         except Exception as e:
             # Use print instead of logger as logging might be shutdown
-            print(f"Warning: Error during HivemindBackend cleanup: {e}")
+            print(f"Warning: Error during Enhanced HivemindBackend cleanup: {e}")
 
 
 # Factory function to create the appropriate backend
-def create_hivemind_backend(**kwargs):
-    """Factory function to create HivemindBackend with emergency wrapper."""
+def create_enhanced_hivemind_backend(**kwargs):
+    """Factory function to create Enhanced HivemindBackend with emergency wrapper."""
     
     # Check if emergency wrapper should be enabled
     enable_wrapper = kwargs.pop('enable_emergency_wrapper', True)
     
-    # Create the backend
+    # Create the enhanced backend
     backend = HivemindBackend(**kwargs)
     
     # Wrap with emergency handler if enabled
@@ -801,26 +1256,6 @@ def create_hivemind_backend(**kwargs):
         return EmergencyTrainingWrapper(backend)
     else:
         return backend
-
-
-# Usage example and environment setup
-def setup_environment_for_robust_training():
-    """Setup environment variables for robust training."""
-    
-    # Reduce timeouts for faster failure detection
-    os.environ.setdefault('HIVEMIND_DHT_TIMEOUT', '60')  # 1 minute timeout
-    os.environ.setdefault('HIVEMIND_STARTUP_TIMEOUT', '30')  # 30 second startup
-    
-    # Enable robust mode by default
-    os.environ.setdefault('HIVEMIND_ROBUST_MODE', 'true')
-    
-    # Set reasonable retry limits
-    os.environ.setdefault('HIVEMIND_MAX_RETRIES', '3')
-    
-    # Enable emergency mode for critical failures
-    os.environ.setdefault('HIVEMIND_EMERGENCY_MODE', 'true')
-    
-    get_logger().info("Environment configured for robust Hivemind training")
 
 
 # Emergency control functions
