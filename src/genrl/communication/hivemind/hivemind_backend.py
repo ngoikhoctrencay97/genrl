@@ -289,6 +289,7 @@ class HivemindBackend(Communication):
     
     def __init__(
         self,
+        world_size: int = None,
         initial_peers: List[str] | None = None,
         timeout: int = 300,
         startup_timeout: int = 120,
@@ -310,7 +311,7 @@ class HivemindBackend(Communication):
     ):
         # Core attributes
         self.dht = None
-        self.world_size = int(os.environ.get("HIVEMIND_WORLD_SIZE", 1))
+        self.world_size = world_size or int(os.environ.get("HIVEMIND_WORLD_SIZE", 1))
         self.timeout = timeout
         self.startup_timeout = startup_timeout
         self.max_retries = max_retries
