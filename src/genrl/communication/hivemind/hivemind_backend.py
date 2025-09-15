@@ -291,6 +291,7 @@ class HivemindBackend(Communication):
         self,
         world_size: int = None,
         initial_peers: List[str] | None = None,
+        identity_path=None,
         timeout: int = 300,
         startup_timeout: int = 120,
         disable_caching: bool = True,
@@ -353,7 +354,7 @@ class HivemindBackend(Communication):
         
         # Store for later use
         self.initial_peers = initial_peers
-        
+        self.identity_path = identity_path
         get_logger().info(f"Initializing Enhanced HivemindBackend (world_size={self.world_size})")
         get_logger().info(f"Auto-restart: {auto_restart_enabled}")
         get_logger().info(f"Memory threshold: {memory_threshold_mb}MB")
@@ -876,6 +877,7 @@ class HivemindBackend(Communication):
                 start=True,
                 host_maddrs=host_maddrs,
                 initial_peers=resolved_peers,
+                identity_path=self.identity_path,
                 startup_timeout=self.startup_timeout,
                 **kwargs
             )
