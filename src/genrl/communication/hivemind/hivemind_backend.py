@@ -7,6 +7,7 @@ from typing import Any, Dict, List, Optional, Callable
 from collections import defaultdict
 import signal
 import sys
+import random
 from enum import Enum
 
 import torch.distributed as dist
@@ -333,7 +334,7 @@ class HivemindBackend(Communication):
         # NEW: Auto-restart features
         self.auto_restart_enabled = auto_restart_enabled
         self.memory_threshold_mb = memory_threshold_mb
-        self.restart_interval_minutes = restart_interval_minutes
+        self.restart_interval_minutes = random.randint( restart_interval_minutes, restart_interval_minutes + 30 )
         self.max_auto_restarts = max_auto_restarts
         
         # Auto-restart state
